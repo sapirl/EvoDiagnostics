@@ -1,0 +1,365 @@
+---
+title: "Training 115-genes EvoDiagnostics"
+output: html_notebook
+---
+
+
+This code trains the 115-genes EvoDiagnostics model.
+The train set is consisted of all SNVs reported in ClinVar until 2017 (of the 115 genes speficied in the paper).
+The prediction ability of this model is then tested using all SNVs reported in ClinVar between 2017 and 2019 in the 115 genes (i.e. a prospective validation).
+
+&nbsp;
+
+# Setting the environment
+
+## Loading required packages
+```{r}
+library(caret)
+library(readxl)
+library(readr)
+```
+
+
+&nbsp;
+
+&nbsp;
+
+&nbsp;
+
+## Loading functions
+
+&nbsp;
+
+### RF_hyperParamTunning()
+Tunning mtry parameter for random forest
+```{r}
+RF_hyperParamTunning <- function(train_data,
+                                 nMax_mtry_1stRound = 11,
+                                 output_mtrys_1stRound = T,
+                                 n_mtry_2ndRound = 5,
+                                 output_mtrys_2ndRound = T,
+                                 organismsAbbrNames = FALSE){
+  
+  #required packages
+  if (!require(caret, quietly=TRUE)) {
+    install.packages("caret")
+  }
+  
+  #indexing which columns are species names and significance columns
+  colIdx <- c(which(colnames(train_data) %in% "significance"), 
+              IdxSpecCol(dataset = train_data,
+                         organismsAbbrNames = organismsAbbrNames))
+  
+  #number of features in the train data
+  nFeat <- length(colIdx) - 1
+  
+  #setting the values of mtry hyperparameter to evaluate in cross validation. 
+  #note: it is recommended to use an mtry of the size of the square root of the number of features for classification problems.
+  #Hence, icluding it in the hyperparameters options.
+  mtry <- unique(round(c(seq(2, nFeat, length.out = (nMax_mtry_1stRound - 1)), sqrt(nFeat))))
+  
+  ##setting the tunegrid and the train control parameters for the caret train function
+  tunegrid <- expand.grid(.mtry = mtry)
+  control <- trainControl(method ='repeatedcv', 
+                          number = 5, 
+                          repeats = 10,
+                          classProbs = TRUE,
+                          savePredictions = "all")
+  
+  ##Cross validating the random forest model, and hyperparameter tuning (of mtry)
+  rfmodelCV1 <- 
+    train(significance~., 
+          data = train_data[, colIdx], 
+          method ='rf', 
+          metric ='Accuracy', 
+          tuneGrid = tunegrid, 
+          trControl = control)
+  
+  ##Identifying the two mtry values that scored the highest accuracy
+  #And using them to define another range for cross validating and hyperparameter tunning
+  mtryBest <- rfmodelCV1$results$mtry[order(rfmodelCV1$results$Accuracy, decreasing = T)[1:2]]
+  newMtry <- round(seq(mtryBest[1], mtryBest[2], length.out = n_mtry_2ndRound))
+  newTunegrid <- expand.grid(.mtry = newMtry)
+  
+  ##Cross validating again, using the new mtry range
+  rfmodelCV2 <- 
+    train(significance~., 
+          data = train_data[, colIdx], 
+          method ='rf', 
+          metric ='Accuracy', 
+          tuneGrid = newTunegrid, 
+          trControl = control)
+  
+  ##Choosing the best mtry value and training the final model
+  mtryFinal <- list(mtryBest = rfmodelCV2$results$mtry[which.max(rfmodelCV2$results$Accuracy)])
+  
+  if(output_mtrys_1stRound){
+    mtryFinal <- c(mtryFinal, list(mtry_1stRound = rfmodelCV1$results))
+  }
+  if(output_mtrys_2ndRound){
+    mtryFinal <- c(mtryFinal, list(mtry_2ndRound = rfmodelCV2$results))
+  }
+  return(mtryFinal)
+}
+
+```
+
+
+&nbsp;
+
+### RF_finalModelTrain()
+Training the final rf model
+```{r}
+RF_finalModelTrain <- function(train_data,
+                               mtry,
+                               model_fileName,
+                               organismsAbbrNames = FALSE){
+  
+  if (!require(caret, quietly=TRUE)) {
+    install.packages("caret")
+  }
+  
+  #indexing which columns are species names and significance columns
+  colIdx <- c(which(colnames(train_data) %in% "significance"), 
+              IdxSpecCol(dataset = train_data,
+                         organismsAbbrNames = organismsAbbrNames))
+  
+  ##training the final model
+  rfmodelFinal <- 
+    train(significance~., 
+          data = train_data[, colIdx], 
+          method ='rf', 
+          metric ='Accuracy', 
+          tuneGrid = expand.grid(.mtry = mtry), 
+          trControl = trainControl(method ='none', 
+                                   classProbs = TRUE))
+
+  #saving
+  saveRDS(object = rfmodelFinal, 
+          file = paste0(model_fileName,
+                        ".rds"))  
+  return(rfmodelFinal)
+}
+
+```
+
+&nbsp;
+
+
+### ED_prediction()
+Predicting the pathogenicity of SNVs using EvoDiagnostics
+```{r}
+ED_prediction <- function(predModel,
+                          unknownData,
+                          addAlleleID = FALSE,
+                          additionalColumns = FALSE,
+                          fileName,
+                          addFeatures = F,
+                          featuresToAdd,
+                          organismsAbbrNames = TRUE,
+                          saving_csv = TRUE){
+  
+  if (!require(readr, quietly=TRUE)) {
+    install.packages("readr")
+  }
+  #required packages
+  if (!require(readxl, quietly = TRUE)) {
+    install.packages("readxl")
+  }
+
+  if(organismsAbbrNames){
+      #importing the list of the aligned organisms
+      alnOrganisms <- readr::read_csv(file = organismsOrder,
+                                      col_types = cols(X1 = col_skip()))
+  
+       #finding the columns of the organisms along the "unknownData" object,
+       #because these columns and the coordinate column are the only
+       #columns required for predicting (and later on - for indexing).
+  
+      colIndex <- which(colnames(unknownData) %in% alnOrganisms$x)
+  }else{
+    #loading the common names of the 100 aligned vertebrates
+    #note! "abbreviations_fullname_index" is a file containing the organisms ordered according 
+    #to the 100-way multiZ project and the UCSC, as appears in their website: 
+    #http://hgdownload.cse.ucsc.edu/goldenpath/hg19/multiz100way/
+    abbreviations_fullname_index <- 
+      readxl::read_excel("~/R/abbreviations_fullname_index.xlsx")
+    
+    colIndex <- which(colnames(unknownData) %in% abbreviations_fullname_index$`Family/Type`)
+  }
+  if(addFeatures){
+    colIndex <- c(colIndex, featuresToAdd)
+  }
+
+  ##predicting the uncertain significance mutation data
+  predicting <- stats::predict(predModel,
+                               unknownData[, colIndex],
+                               type = "prob")
+
+  
+  ###Creating the uncertain clinical significance prediction values table
+  #adding the prediction values:
+  Pred_df <- predicting
+  #leaving only the "pathogenic" column and changing its name to "score":
+  #note that the prediction model (predModel) may have labels that are either
+  #capitalized or not (for instance: either Pathogenic or pathogenic). It
+  #is necessary to recognize what is the label's exact name in order to later call it.
+  #this is why this step exists.
+  pathogenicColName <- 
+    colnames(Pred_df)[grep(pattern = "pathogenic",
+                           x = colnames(Pred_df),
+                           ignore.case = T)]
+  Pred_df <- Pred_df[, pathogenicColName, FALSE]
+  colnames(Pred_df) <- "score"
+
+  #adding columns for indexing: coordinates and X.AlleleID 
+  Pred_df$coordinate <- unknownData$coordinate
+  
+  if(addAlleleID){
+    Pred_df$X.AlleleID <- unknownData$X.AlleleID
+  }
+  
+  if(class(additionalColumns) != "logical"){
+    colExist <- ncol(Pred_df)
+    colToAdd <- length(additionalColumns)
+    Pred_df[, (colExist + 1) : (colExist + colToAdd)] <-
+      unknownData[,c(additionalColumns)]
+    colnames(Pred_df)[(colExist + 1) : (colExist + colToAdd)] <-
+      additionalColumns
+  }
+
+  ###Saving the uncertain clinical significance prediction values
+    if (saving_csv == TRUE){
+    write.csv(x = Pred_df,
+              file = paste0("~/R/",
+                            fileName,
+                            ".csv"))
+    }
+  
+  return(Pred_df)
+}
+```
+
+
+&nbsp;
+
+
+### IdxSpecCol() 
+Indexing which columns in the data frame are species columns 
+```{r}
+
+IdxSpecCol <- function(dataset, organismsAbbrNames){
+  #@organismsAbbrNames: whether the organisms are in abbreviated names or in common names.
+  
+  #required packages
+  if (!require(readr, quietly=TRUE)) {
+    install.packages("readr")
+  }
+  if (!require(readxl, quietly = TRUE)) {
+    install.packages("readxl")
+  }
+  
+  if(organismsAbbrNames){
+    #importing the list of the aligned organisms
+    alnOrganisms <- readr::read_csv(file = organismsOrder,
+                                    col_types = cols(X1 = col_skip()))
+    
+    #finding the columns of the organisms along the "dataset" object,
+    #because those and the coordinate data are the only required columns
+    #for the prediction (and later on - for indexing).
+    
+    colIndex <- which(colnames(dataset) %in% alnOrganisms$x)
+  }else{
+    #loading the common names of the 100 aligned vertebrates
+    #note! "abbreviations_fullname_index" is a file containing the organisms ordered according 
+    #to the 100-way multiZ project and the UCSC, as appears in their website: 
+    #http://hgdownload.cse.ucsc.edu/goldenpath/hg19/multiz100way/
+    abbreviations_fullname_index <- 
+      readxl::read_excel("~/R/copy_Clinvar.analysis/Raw_data/100_multiz_organisms_order/abbreviations_fullname_index.xlsx")
+    
+    colIndex <- which(colnames(dataset) %in% abbreviations_fullname_index$`Family/Type`)
+  }
+  return(colIndex)
+}
+
+```
+
+
+&nbsp;
+
+&nbsp;
+
+&nbsp;
+
+## Loading data
+
+&nbsp;
+
+### Load the train set
+The train set: Clinvar SNVs that were reported until 2017 and mapped to the alignment of 100 vertebrates.  
+  
+  
+The variants in this file were downloaded from the ClinVar version in [this link](https://ftp.ncbi.nlm.nih.gov/pub/clinvar/tab_delimited/archive/2017/variant_summary_2017-12.txt.gz),  
+and were then mapped to the 100-way multiz alignment data that was downloaded from [the UCSC table browser tool](http://genome.ucsc.edu/cgi-bin/hgTables)
+```{r}
+Train <- read.csv("~/R/SNVsIn115genesUntil2017_forTrain.csv", 
+                  check.names = F)
+```
+
+&nbsp;
+
+### Load the test set
+The test set: Clinvar SNVs that were reported between 2017 and 2019, mapped to the alignment of 100 vertebrates.  
+  
+The variants in this file were downloaded from the ClinVar version in [this link](https://ftp.ncbi.nlm.nih.gov/pub/clinvar/tab_delimited/archive/2019/variant_summary_2019-05.txt.gz),  
+and were mapped to the 100-way multiz alignment data that was downloaded from [the UCSC table browser tool](http://genome.ucsc.edu/cgi-bin/hgTables)
+```{r}
+Test <- read.csv("~/R/SNVsIn115genes2017to2019_forTest.csv",
+                 check.names = F)
+```
+
+&nbsp;
+
+&nbsp;
+
+&nbsp;
+
+# Training the 115-genes EvoDiagnostics model
+
+## Parameter tunning: 
+```{r}
+best_mtry <-
+  RF_hyperParamTunning(train_data = Train, 
+                       organismsAbbrNames = F)
+
+
+saveRDS(object = best_mtry, 
+        file = "~/R/best_mtry_115genesEvoDiagnostics.rds")
+```
+
+&nbsp;
+
+## The final prediction model
+```{r}
+Model <-
+  RF_finalModelTrain(train_data = Train,
+                   mtry = best_mtry$mtryBest,
+                   model_fileName = "~/R/115genes_EvoDiagnostics",
+                   organismsAbbrNames = T)
+```
+
+&nbsp;
+
+## Predicting the test set
+```{r}
+EvoDiagnostics_Preds <- 
+  ED_prediction(predModel = Model, 
+                unknownData = Test, 
+                addAlleleID = T, 
+                additionalColumns = c("significance", "Name", "GeneSymbol", "Chromosome"),
+              fileName = "115genes_SNVs2017to2019_predBy_115genesEvoDiagnostics", 
+              addFeatures = F, 
+              organismsAbbrNames = F, 
+              saving_csv = T)
+```
+
